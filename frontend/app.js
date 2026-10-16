@@ -11,7 +11,7 @@ const audio = $("#audio");
 
 
 /* ---------- playback abstraction: server audio stream, or YouTube embed fallback ---------- */
-const Y = { player: null, ready: false, pending: null, timer: null };
+const Y = { player: null, ready: false, pending: null, timer: null, box: null, unlocked: false, watch: 0 };
 const inYT = () => S.mode === "yt";
 const curTime = () => (inYT() ? (Y.ready && Y.player.getCurrentTime ? Y.player.getCurrentTime() : 0) : audio.currentTime) || 0;
 const curDur = () => (inYT() ? (Y.ready && Y.player.getDuration ? Y.player.getDuration() : 0) : audio.duration) || 0;
@@ -20,28 +20,69 @@ const isPaused = () => (inYT() ? !(Y.ready && Y.player.getPlayerState && Y.playe
 const pauseAll = () => { if (inYT()) { Y.ready && Y.player.pauseVideo(); } else audio.pause(); };
 const resumeAll = () => { if (inYT()) { Y.ready && Y.player.playVideo(); } else audio.play().catch(() => {}); };
 
+// YouTube's embed needs the Referer header (without it: "Error 153"); make sure nothing strips it.
+(function () { const m = document.createElement("meta"); m.name = "referrer"; m.content = "strict-origin-when-cross-origin"; document.head.appendChild(m); })();
+
 function loadYTApi() {
   return new Promise((resolve, reject) => {
     if (window.YT && YT.Player) return resolve();
-    window.onYouTubeIframeAPIReady = () => resolve();
-    const sc = document.createElement("script");
-    sc.src = "https://www.youtube.com/iframe_api"; sc.onerror = () => reject(new Error("YouTube player failed to load"));
-    document.head.appendChild(sc);
+    const prev = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => { prev && prev(); resolve(); };
+    if (!document.getElementById("yt-api-script")) {
+      const sc = document.createElement("script");
+      sc.id = "yt-api-script"; sc.src = "https://www.youtube.com/iframe_api";
+      sc.onerror = () => reject(new Error("YouTube player failed to load (blocked network?)"));
+      document.head.appendChild(sc);
+    }
   });
 }
+
+/* The player box is created here (no dependency on index.html/style.css). It stays rendered at all times,
+   off-screen while the full player is closed, and is laid over the cover art while it is open. */
+function ensureYTBox() {
+  if (Y.box) return Y.box;
+  const box = document.createElement("div");
+  box.id = "tb-yt-box";
+  box.style.cssText = "position:fixed;left:-9999px;top:0;width:320px;height:180px;z-index:31;background:#000;border-radius:14px;overflow:hidden";
+  box.innerHTML = '<div id="tb-yt-player"></div>';
+  document.body.appendChild(box);
+  Y.box = box;
+  const sc = document.querySelector(".sheet-scroll");
+  if (sc) sc.addEventListener("scroll", layoutYT, { passive: true });
+  window.addEventListener("resize", layoutYT);
+  return box;
+}
+function layoutYT() {
+  const box = Y.box; if (!box) return;
+  const cover = $("#cover");
+  if ($("#sheet").hidden) {
+    box.style.cssText = "position:fixed;left:-9999px;top:0;width:320px;height:180px;z-index:31;background:#000;border-radius:14px;overflow:hidden";
+    if (cover) cover.style.cssText = "";
+    return;
+  }
+  const w = Math.min(window.innerWidth - 44, 420), h = Math.round((w * 9) / 16);
+  if (cover) cover.style.cssText = `visibility:hidden;width:${w}px;height:${h}px;aspect-ratio:auto`;
+  const r = cover.getBoundingClientRect();
+  const visible = r.top > 56 && r.bottom < window.innerHeight;
+  box.style.cssText = `position:fixed;left:${Math.round((window.innerWidth - w) / 2)}px;top:${Math.round(r.top)}px;width:${w}px;height:${h}px;z-index:31;background:#000;border-radius:14px;overflow:hidden;${visible ? "" : "opacity:0;pointer-events:none"}`;
+}
+const ytErrorText = { 152: "embed blocked (error 152)", 153: "embed config error 153 - page not sending a Referer", 2: "invalid video", 5: "player error", 100: "video removed/private", 101: "embedding disabled by the owner", 150: "embedding disabled by the owner" };
+
 async function playViaYT(t) {
   if (!inYT()) {
     S.mode = "yt";
     audio.pause(); audio.removeAttribute("src"); audio.load();
-    document.body.classList.add("yt-mode");
-    toast("Using the YouTube player for this server (keeps playing while the screen is on)", 5000);
   }
-  try { await loadYTApi(); } catch (e) { toast(e.message); return; }
+  ensureYTBox();
+  if (!(window.YT && YT.Player)) {
+    try { await loadYTApi(); } catch (e) { toast(e.message, 6000); return; }
+  }
+  const watch = ++Y.watch;
   if (!Y.player) {
     Y.pending = t.videoId;
-    Y.player = new YT.Player("yt-player", {
+    Y.player = new YT.Player("tb-yt-player", {
       width: "100%", height: "100%", videoId: t.videoId,
-      playerVars: { playsinline: 1, autoplay: 1, rel: 0, origin: location.origin },
+      playerVars: { playsinline: 1, autoplay: 1, rel: 0, controls: 1, origin: location.origin },
       events: {
         onReady: () => { Y.ready = true; if (Y.pending) { Y.player.loadVideoById(Y.pending); Y.pending = null; } },
         onStateChange: onYTState, onError: onYTError,
@@ -50,13 +91,27 @@ async function playViaYT(t) {
     Y.timer = setInterval(tickYT, 500);
   } else if (Y.ready) Y.player.loadVideoById(t.videoId);
   else Y.pending = t.videoId;
+  // iPhone/Safari only starts a video from a tap on the video itself. Until the first song has started,
+  // show the player right away so one tap on its own ▶ unlocks everything (later songs then follow automatically).
+  if (!Y.unlocked) {
+    if ($("#sheet").hidden) openSheet();
+    toast("Tap ▶ on the video once to start. After that, songs play on by themselves.", 9000);
+    setTimeout(() => {
+      if (watch !== Y.watch || Y.unlocked) return;
+      const st = Y.ready && Y.player.getPlayerState ? Y.player.getPlayerState() : "not ready";
+      toast(`Still waiting for the video. Tap the video's ▶. (player state: ${st}${Y.ready ? "" : " - YouTube player script may be blocked"})`, 9000);
+    }, 5000);
+  }
 }
 function onYTState(e) {
-  if (e.data === 1) { S.failStreak = 0; setPlayIcon(true); setState("playing"); }
+  if (e.data === 1) { Y.unlocked = true; S.failStreak = 0; setPlayIcon(true); setState("playing"); }
   else if (e.data === 2) { setPlayIcon(false); setState("paused"); }
   else if (e.data === 0) handleEnded();
 }
-function onYTError() { onAudioError(); }   // 100/101/150: removed or not embeddable -> skip
+function onYTError(e) {
+  const why = ytErrorText[e && e.data] || `error ${e && e.data}`;
+  onAudioError(`YouTube won't play this one here (${why})`);
+}
 function tickYT() {
   if (!inYT() || !Y.ready) return;
   progress(curTime(), curDur());
@@ -339,16 +394,16 @@ function onStreamFailed() {
   if (!t || inYT()) return onAudioError();
   playViaYT(t);   // server couldn't fetch audio (often a blocked host IP): use YouTube's own player
 }
-function onAudioError() {
+function onAudioError(reason) {
   if (Date.now() - lastErrAt < 1500) return;  // one skip per failure
   lastErrAt = Date.now();
   S.failStreak++;
   const t = cur();
   if (S.failStreak <= 3) {
-    toast(`Couldn't play “${t?.title || "song"}” — skipping`);
+    toast(reason ? `${reason} — skipping` : `Couldn't play “${t?.title || "song"}” — skipping`);
     P.skipped.push(t?.videoId);
     setTimeout(() => next(), 400);
-  } else { setPlayIcon(false); toast("Playback keeps failing — check the server / YouTube access."); }
+  } else { setPlayIcon(false); toast(reason ? `${reason}. Stopped after 4 failures in a row.` : "Playback keeps failing — check the server / YouTube access.", 8000); }
 }
 audio.addEventListener("error", () => { if (audio.src && audio.error && !inYT()) onStreamFailed(); });
 audio.addEventListener("stalled", () => { /* network hiccup: browser retries by itself */ });
@@ -359,7 +414,11 @@ function setPlayIcon(playing) {
   $("#mini-play").textContent = icon; $("#play").textContent = icon;
   document.body.classList.toggle("paused", !playing);
 }
-function togglePlay() { if (!cur()) return; isPaused() ? resumeAll() : pauseAll(); }
+function togglePlay() {
+  if (!cur()) return;
+  if (inYT() && !Y.unlocked) { openSheet(); toast("Tap ▶ on the video to start."); return; }
+  isPaused() ? resumeAll() : pauseAll();
+}
 $("#mini-play").addEventListener("click", togglePlay);
 $("#play").addEventListener("click", togglePlay);
 $("#mini-next").addEventListener("click", () => next({ manual: true }));
@@ -429,8 +488,8 @@ function updateNowPlaying() {
   document.querySelectorAll("#results-list .track, #recent-list .track, #liked-list .track").forEach((li) => li.classList.toggle("current", li.dataset.id === t.videoId));
   setMediaSession(t);
 }
-function openSheet() { if (!cur()) return; $("#sheet").hidden = false; document.body.style.overflow = "hidden"; $("#sheet-close").focus(); }
-function closeSheet() { $("#sheet").hidden = true; document.body.style.overflow = ""; $("#mini-open").focus(); }
+function openSheet() { if (!cur()) return; $("#sheet").hidden = false; document.body.style.overflow = "hidden"; $("#sheet-close").focus(); layoutYT(); setTimeout(layoutYT, 300); }
+function closeSheet() { $("#sheet").hidden = true; document.body.style.overflow = ""; $("#mini-open").focus(); layoutYT(); }
 
 /* ---------- Media Session: lock screen, notification shade, Bluetooth / CarPlay / Android Auto ---------- */
 function setState(s) { if ("mediaSession" in navigator) navigator.mediaSession.playbackState = s; }
@@ -466,7 +525,7 @@ function updatePosition() {
 if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1")) {
   navigator.serviceWorker.register("sw.js").catch(() => {});
 }
-document.body.classList.add("yt-mode");
+loadYTApi().catch(() => {});   // preload so the first tap can start the player immediately
 toggle($("#autoplay"), "autoplay", S.autoplay);
 loadChips();
 renderHome();
