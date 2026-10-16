@@ -11,14 +11,14 @@ const audio = $("#audio");
 
 
 /* ---------- playback abstraction: server audio stream, or YouTube embed fallback ---------- */
-const Y = { player: null, ready: false, pending: null, timer: null, box: null, unlocked: false, watch: 0 };
+const Y = { player: null, ready: false, pending: null, timer: null, box: null, unlocked: false, watch: 0, userPaused: false, lastPlayingAt: 0, visibleSince: Date.now() };
 const inYT = () => S.mode === "yt";
 const curTime = () => (inYT() ? (Y.ready && Y.player.getCurrentTime ? Y.player.getCurrentTime() : 0) : audio.currentTime) || 0;
 const curDur = () => (inYT() ? (Y.ready && Y.player.getDuration ? Y.player.getDuration() : 0) : audio.duration) || 0;
 const seekTo = (sec) => { if (inYT()) { Y.ready && Y.player.seekTo(sec, true); } else audio.currentTime = sec; };
 const isPaused = () => (inYT() ? !(Y.ready && Y.player.getPlayerState && Y.player.getPlayerState() === 1) : audio.paused);
-const pauseAll = () => { if (inYT()) { Y.ready && Y.player.pauseVideo(); } else audio.pause(); };
-const resumeAll = () => { if (inYT()) { Y.ready && Y.player.playVideo(); } else audio.play().catch(() => {}); };
+const pauseAll = () => { Y.userPaused = true; stopKeepAlive(); if (inYT()) { Y.ready && Y.player.pauseVideo(); } else audio.pause(); };
+const resumeAll = () => { Y.userPaused = false; startKeepAlive(); if (inYT()) { Y.ready && Y.player.playVideo(); } else audio.play().catch(() => {}); };
 
 // YouTube's embed needs the Referer header (without it: "Error 153"); make sure nothing strips it.
 (function () { const m = document.createElement("meta"); m.name = "referrer"; m.content = "strict-origin-when-cross-origin"; document.head.appendChild(m); })();
@@ -69,6 +69,7 @@ function layoutYT() {
 const ytErrorText = { 152: "embed blocked (error 152)", 153: "embed config error 153 - page not sending a Referer", 2: "invalid video", 5: "player error", 100: "video removed/private", 101: "embedding disabled by the owner", 150: "embedding disabled by the owner" };
 
 async function playViaYT(t) {
+  startKeepAlive();   // first thing, while we are still inside the tap that started playback
   if (!inYT()) {
     S.mode = "yt";
     audio.pause(); audio.removeAttribute("src"); audio.load();
@@ -104,9 +105,13 @@ async function playViaYT(t) {
   }
 }
 function onYTState(e) {
-  if (e.data === 1) { Y.unlocked = true; S.failStreak = 0; setPlayIcon(true); setState("playing"); }
-  else if (e.data === 2) { setPlayIcon(false); setState("paused"); }
-  else if (e.data === 0) handleEnded();
+  if (e.data === 1) { Y.unlocked = true; Y.userPaused = false; Y.lastPlayingAt = Date.now(); startKeepAlive(); S.failStreak = 0; setPlayIcon(true); setState("playing"); }
+  else if (e.data === 2) {
+    // a pause while the page has been visible for a while = the user pressed pause on YouTube's own controls
+    if (document.visibilityState === "visible" && Date.now() - Y.visibleSince > 3000) Y.userPaused = true;
+    setPlayIcon(false); setState("paused");
+  }
+  else if (e.data === 0) { setState("none"); handleEnded(); }
 }
 function onYTError(e) {
   const why = ytErrorText[e && e.data] || `error ${e && e.data}`;
@@ -114,8 +119,10 @@ function onYTError(e) {
 }
 function tickYT() {
   if (!inYT() || !Y.ready) return;
+  if (Y.player.getPlayerState && Y.player.getPlayerState() === 1) Y.lastPlayingAt = Date.now();
   progress(curTime(), curDur());
 }
+
 
 /* ---------- storage (every access guarded: private mode / blocked storage) ---------- */
 const store = {
@@ -137,8 +144,12 @@ const S = {
   seeking: false,
   startedAt: 0,
   loadToken: 0,
-  mode: "yt",       // iframe-only: YouTube plays the video directly in the browser; the server only does search + "what's next"
+  mode: "stream",   // "stream" = server audio (plays with screen locked); "yt" = YouTube player (screen must stay on)
 };
+// If the server recently failed to fetch audio (YouTube blocks many cloud hosts), go straight to the YouTube player.
+// Open the site with ?stream=1 to clear that and try the audio stream again.
+if (new URLSearchParams(location.search).get("stream")) store.set("streamBlockedUntil", 0);
+if (store.get("streamBlockedUntil", 0) > Date.now()) S.mode = "yt";
 // Taste profile: sent to the server so autoplay adapts to this listener.
 const P = {
   history: store.get("history", []),            // played ids (newest last)
@@ -152,6 +163,61 @@ const saveProfile = () => {
   P.history = P.history.slice(-300); P.recentTracks = P.recentTracks.slice(0, 30); P.skipped = P.skipped.slice(-150);
   for (const k of Object.keys(P)) store.set(k === "recentTracks" ? "recentTracks" : k, P[k]);
 };
+
+/* ---------- Stay awake: the phone only pauses the YouTube player because the screen locks.
+   Screen Wake Lock stops the auto-lock; a black "saver" overlay (OLED-friendly) hides the screen while
+   the player keeps running underneath. Tap anywhere to bring the app back. Used only in YouTube-player mode. ---------- */
+const WL = { lock: null, on: store.get("stayAwake", true), idle: null, saver: null, btn: null };
+const IDLE_MS = window.TUBEBEAT_IDLE_MS || 15000;
+async function acquireWL() {
+  if (!WL.on || !inYT() || WL.lock || document.visibilityState !== "visible") return;
+  if (!("wakeLock" in navigator)) { if (!WL.warned) { WL.warned = true; toast("This browser can't keep the screen on, so playback will stop when the phone locks."); } return; }
+  try {
+    WL.lock = await navigator.wakeLock.request("screen");
+    WL.lock.addEventListener("release", () => { WL.lock = null; });
+  } catch (e) { WL.lock = null; }
+}
+function releaseWL() { try { WL.lock && WL.lock.release(); } catch { /* ignore */ } WL.lock = null; }
+function hideSaver() { if (WL.saver) { WL.saver.hidden = true; WL.saver.style.display = "none"; } }
+function showSaver() {
+  if (!WL.on || !inYT() || isPaused() || !WL.lock) return;   // only dim while actually playing and holding the wake lock
+  if (!WL.saver) {
+    const d = document.createElement("div");
+    d.id = "tb-saver";
+    d.style.cssText = "position:fixed;inset:0;z-index:60;background:#000;color:#555;display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;font:14px Inter,system-ui,sans-serif;touch-action:manipulation";
+    d.innerHTML = '<div id="tb-saver-title" style="color:#777;font-size:16px;margin-bottom:6px"></div><div id="tb-saver-sub"></div><div style="margin-top:28px;font-size:12px;color:#444">Screen is kept awake while music plays. Tap anywhere to wake.</div>';
+    d.addEventListener("pointerdown", (e) => { e.stopPropagation(); e.preventDefault(); hideSaver(); armIdle(); });
+    document.body.appendChild(d);
+    WL.saver = d;
+  }
+  const t = cur();
+  $("#tb-saver-title").textContent = t ? t.title : "";
+  $("#tb-saver-sub").textContent = t ? t.artist : "";
+  WL.saver.hidden = false; WL.saver.style.display = "flex";
+}
+function armIdle() {
+  clearTimeout(WL.idle);
+  if (WL.on && inYT() && !isPaused()) WL.idle = setTimeout(showSaver, IDLE_MS);
+}
+function onPlayingChanged(playing) {
+  if (playing && inYT()) { acquireWL(); armIdle(); }
+  else { clearTimeout(WL.idle); hideSaver(); if (!playing) releaseWL(); }
+}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && !isPaused()) { acquireWL(); armIdle(); } });
+["pointerdown", "keydown", "touchstart"].forEach((ev) => document.addEventListener(ev, () => { if (!isPaused()) acquireWL(); if (!WL.saver || WL.saver.hidden) armIdle(); }, { capture: true, passive: true }));
+function bindStayAwakeButton() {
+  const top = document.querySelector(".sheet-top"); if (!top || WL.btn) return;
+  const b = document.createElement("button");
+  b.className = "icon"; b.id = "stay-awake"; b.textContent = "☀"; b.title = "Keep screen on while playing";
+  b.setAttribute("aria-label", "Keep screen on while playing"); b.setAttribute("aria-pressed", String(WL.on));
+  b.addEventListener("click", () => {
+    WL.on = !WL.on; store.set("stayAwake", WL.on); b.setAttribute("aria-pressed", String(WL.on));
+    if (WL.on) { acquireWL(); armIdle(); toast("Screen stays on while music plays (dims to black after a few seconds)"); }
+    else { releaseWL(); hideSaver(); toast("Screen can lock again. The YouTube player pauses when it does."); }
+  });
+  top.insertBefore(b, document.querySelector("#sheet-share")); WL.btn = b;
+}
+
 
 /* ---------- helpers ---------- */
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -368,8 +434,11 @@ function handleEnded() {
   next();
 }
 audio.addEventListener("ended", () => { if (!inYT()) handleEnded(); });
-audio.addEventListener("play", () => { setPlayIcon(true); setState("playing"); });
-audio.addEventListener("pause", () => { setPlayIcon(false); if (!audio.ended) setState("paused"); });
+audio.addEventListener("play", () => { if (!inYT()) Y.userPaused = false; setPlayIcon(true); setState("playing"); });
+audio.addEventListener("pause", () => {
+  if (!inYT() && !audio.ended && document.visibilityState === "visible" && Date.now() - Y.visibleSince > 3000) Y.userPaused = true;
+  setPlayIcon(false); if (!audio.ended) setState("paused");
+});
 audio.addEventListener("playing", () => { S.failStreak = 0; });
 audio.addEventListener("loadedmetadata", () => { $("#t-dur").textContent = fmt(audio.duration); updatePosition(); });
 audio.addEventListener("durationchange", updatePosition);
@@ -387,11 +456,13 @@ function progress(c, d) {
   }
   if (Date.now() - lastPos > 4000) { lastPos = Date.now(); updatePosition(); }
 }
-audio.addEventListener("timeupdate", () => { if (!inYT()) progress(audio.currentTime, audio.duration); });
+audio.addEventListener("timeupdate", () => { if (!inYT()) { Y.lastPlayingAt = Date.now(); progress(audio.currentTime, audio.duration); } });
 let lastErrAt = 0;
 function onStreamFailed() {
   const t = cur();
   if (!t || inYT()) return onAudioError();
+  store.set("streamBlockedUntil", Date.now() + 6 * 3600 * 1000);   // remember for 6 hours
+  toast("This server can't fetch audio (YouTube blocks it), so the YouTube player is used. It stops when the screen locks.", 7000);
   playViaYT(t);   // server couldn't fetch audio (often a blocked host IP): use YouTube's own player
 }
 function onAudioError(reason) {
@@ -413,6 +484,7 @@ function setPlayIcon(playing) {
   const icon = playing ? "⏸" : "▶";
   $("#mini-play").textContent = icon; $("#play").textContent = icon;
   document.body.classList.toggle("paused", !playing);
+  onPlayingChanged(playing);
 }
 function togglePlay() {
   if (!cur()) return;
@@ -503,28 +575,106 @@ function setMediaSession(t) {
 }
 function updatePosition() {
   if (!("mediaSession" in navigator) || !navigator.mediaSession.setPositionState) return;
-  if (inYT()) return;
-  const d = audio.duration;
+  const d = curDur();
   if (!d || !isFinite(d)) return;
-  try { navigator.mediaSession.setPositionState({ duration: d, playbackRate: audio.playbackRate || 1, position: Math.min(audio.currentTime, d) }); } catch { /* ignore */ }
+  try { navigator.mediaSession.setPositionState({ duration: d, playbackRate: inYT() ? 1 : audio.playbackRate || 1, position: Math.min(curTime(), d) }); } catch { /* ignore */ }
 }
 (function bindMediaKeys() {
   if (!("mediaSession" in navigator)) return;
   const set = (name, fn) => { try { navigator.mediaSession.setActionHandler(name, fn); } catch { /* unsupported action */ } };
-  set("play", () => audio.play().catch(() => {}));
-  set("pause", () => audio.pause());
+  // These go through the playback layer, so they control whichever player is active (audio stream or YouTube iframe).
+  set("play", () => resumeAll());
+  set("pause", () => pauseAll());
   set("previoustrack", () => prev());
   set("nexttrack", () => next({ manual: true }));
-  set("seekbackward", (d) => { audio.currentTime = Math.max(0, audio.currentTime - (d.seekOffset || 10)); });
-  set("seekforward", (d) => { audio.currentTime = Math.min(audio.duration || 1e9, audio.currentTime + (d.seekOffset || 10)); });
-  set("seekto", (d) => { if (d.fastSeek && "fastSeek" in audio) audio.fastSeek(d.seekTime); else audio.currentTime = d.seekTime; updatePosition(); });
-  set("stop", () => { audio.pause(); audio.currentTime = 0; });
+  set("seekbackward", (d) => seekTo(Math.max(0, curTime() - (d.seekOffset || 10))));
+  set("seekforward", (d) => { const dur = curDur(), pos = curTime() + (d.seekOffset || 10); seekTo(dur ? Math.min(dur, pos) : pos); });
+  set("seekto", (d) => { if (Number.isFinite(d.seekTime)) { seekTo(d.seekTime); updatePosition(); } });
+  set("stop", () => { pauseAll(); seekTo(0); });
 })();
+
+
+
+/* ---------- Background layer (experimental) ----------
+   A silent looping <audio> runs underneath the YouTube iframe. It keeps the page's audio session alive, makes this page
+   the "Now Playing" app on the lock screen / car display, and lets the page keep running while the screen is locked so it
+   can nudge the iframe to play again. Whether the YouTube player itself agrees to keep playing is up to the phone and YouTube. */
+const KA = { el: null, on: store.get("bgLayer", true), timer: null, btn: null };
+function silentWavUrl() {
+  const sr = 8000, n = sr, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, str) => [...str].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); w(8, "WAVEfmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, "data"); v.setUint32(40, n * 2, true);
+  return URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+}
+function startKeepAlive() {
+  if (!KA.on || !inYT()) return;
+  if (!KA.el) { const a = new Audio(silentWavUrl()); a.loop = true; a.setAttribute("playsinline", ""); KA.el = a; }
+  if (KA.el.paused) KA.el.play().catch(() => { /* needs a tap first; retried on the next play */ });
+  if (!KA.timer) KA.timer = setInterval(keepAliveTick, 1000);
+}
+function stopKeepAlive() { if (KA.el) KA.el.pause(); }
+function keepAliveTick() {
+  // While the page is in the background and the phone paused our video, keep asking the player to play.
+  if (document.visibilityState === "hidden" && REC.wasPlaying && !Y.userPaused && inYT() && Y.ready && isPaused()) {
+    try { Y.player.playVideo(); } catch { /* ignore */ }
+  }
+}
+function bindBgLayerButton() {
+  const top = document.querySelector(".sheet-top"); if (!top || KA.btn) return;
+  const b = document.createElement("button");
+  b.className = "icon"; b.id = "bg-layer"; b.textContent = "♪"; b.title = "Background layer (experimental)";
+  b.setAttribute("aria-label", "Background layer, experimental"); b.setAttribute("aria-pressed", String(KA.on));
+  b.addEventListener("click", () => {
+    KA.on = !KA.on; store.set("bgLayer", KA.on); b.setAttribute("aria-pressed", String(KA.on));
+    if (KA.on) { startKeepAlive(); toast("Background layer on (experimental): helps keep playing when you leave the page"); }
+    else { stopKeepAlive(); toast("Background layer off"); }
+  });
+  top.insertBefore(b, document.querySelector("#stay-awake") || document.querySelector("#sheet-share")); KA.btn = b;
+}
+
+/* ---------- Recover after the phone paused us (screen lock / leaving the browser) ----------
+   The OS decides to pause web video when the screen locks; a page can't prevent that. What we can do is notice it
+   and fix it the moment the page is visible again: resume where it stopped, or move on if the song ended meanwhile. */
+const REC = { wasPlaying: false, pos: 0, vid: null };
+function onHidden() {
+  REC.wasPlaying = !Y.userPaused && !!cur() && Date.now() - Y.lastPlayingAt < 2500;
+  REC.pos = curTime(); REC.vid = cur() ? cur().videoId : null;
+}
+async function recoverPlayback() {
+  const t = cur();
+  if (!REC.wasPlaying || !t) return;
+  REC.wasPlaying = false;
+  if (inYT()) {
+    if (!Y.ready) return;
+    const st = Y.player.getPlayerState();
+    if (st === 1) return;                                   // still playing: nothing to do
+    if (st === 0) { handleEnded(); return; }                // finished while we were away: next song
+    const loaded = Y.player.getVideoData ? Y.player.getVideoData().video_id : t.videoId;
+    if (loaded && loaded !== t.videoId) Y.player.loadVideoById({ videoId: t.videoId, startSeconds: Math.max(0, REC.pos - 1) });
+    else Y.player.playVideo();
+    setTimeout(() => {                                      // phones may insist on a tap: bring the video into view
+      if (isPaused() && !Y.userPaused) { if ($("#sheet").hidden) openSheet(); toast("Tap ▶ on the video to resume.", 6000); }
+    }, 1500);
+  } else if (audio.paused && !audio.ended) {
+    audio.play().catch(() => toast("Tap ▶ to resume."));
+  }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") onHidden();
+  else { Y.visibleSince = Date.now(); recoverPlayback(); }
+});
+window.addEventListener("pagehide", onHidden);
+window.addEventListener("pageshow", () => { Y.visibleSince = Date.now(); recoverPlayback(); });
+window.addEventListener("focus", () => { if (REC.wasPlaying) recoverPlayback(); });
 
 /* ---------- boot ---------- */
 if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1")) {
   navigator.serviceWorker.register("sw.js").catch(() => {});
 }
+bindStayAwakeButton();
+bindBgLayerButton();
 loadYTApi().catch(() => {});   // preload so the first tap can start the player immediately
 toggle($("#autoplay"), "autoplay", S.autoplay);
 loadChips();
