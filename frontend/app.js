@@ -9,6 +9,59 @@ const API = (window.TUBEBEAT_API || new URLSearchParams(location.search).get("ap
 const $ = (s) => document.querySelector(s);
 const audio = $("#audio");
 
+
+/* ---------- playback abstraction: server audio stream, or YouTube embed fallback ---------- */
+const Y = { player: null, ready: false, pending: null, timer: null };
+const inYT = () => S.mode === "yt";
+const curTime = () => (inYT() ? (Y.ready && Y.player.getCurrentTime ? Y.player.getCurrentTime() : 0) : audio.currentTime) || 0;
+const curDur = () => (inYT() ? (Y.ready && Y.player.getDuration ? Y.player.getDuration() : 0) : audio.duration) || 0;
+const seekTo = (sec) => { if (inYT()) { Y.ready && Y.player.seekTo(sec, true); } else audio.currentTime = sec; };
+const isPaused = () => (inYT() ? !(Y.ready && Y.player.getPlayerState && Y.player.getPlayerState() === 1) : audio.paused);
+const pauseAll = () => { if (inYT()) { Y.ready && Y.player.pauseVideo(); } else audio.pause(); };
+const resumeAll = () => { if (inYT()) { Y.ready && Y.player.playVideo(); } else audio.play().catch(() => {}); };
+
+function loadYTApi() {
+  return new Promise((resolve, reject) => {
+    if (window.YT && YT.Player) return resolve();
+    window.onYouTubeIframeAPIReady = () => resolve();
+    const sc = document.createElement("script");
+    sc.src = "https://www.youtube.com/iframe_api"; sc.onerror = () => reject(new Error("YouTube player failed to load"));
+    document.head.appendChild(sc);
+  });
+}
+async function playViaYT(t) {
+  if (!inYT()) {
+    S.mode = "yt";
+    audio.pause(); audio.removeAttribute("src"); audio.load();
+    document.body.classList.add("yt-mode");
+    toast("Using the YouTube player for this server (keeps playing while the screen is on)", 5000);
+  }
+  try { await loadYTApi(); } catch (e) { toast(e.message); return; }
+  if (!Y.player) {
+    Y.pending = t.videoId;
+    Y.player = new YT.Player("yt-player", {
+      width: "100%", height: "100%", videoId: t.videoId,
+      playerVars: { playsinline: 1, autoplay: 1, rel: 0, origin: location.origin },
+      events: {
+        onReady: () => { Y.ready = true; if (Y.pending) { Y.player.loadVideoById(Y.pending); Y.pending = null; } },
+        onStateChange: onYTState, onError: onYTError,
+      },
+    });
+    Y.timer = setInterval(tickYT, 500);
+  } else if (Y.ready) Y.player.loadVideoById(t.videoId);
+  else Y.pending = t.videoId;
+}
+function onYTState(e) {
+  if (e.data === 1) { S.failStreak = 0; setPlayIcon(true); setState("playing"); }
+  else if (e.data === 2) { setPlayIcon(false); setState("paused"); }
+  else if (e.data === 0) handleEnded();
+}
+function onYTError() { onAudioError(); }   // 100/101/150: removed or not embeddable -> skip
+function tickYT() {
+  if (!inYT() || !Y.ready) return;
+  progress(curTime(), curDur());
+}
+
 /* ---------- storage (every access guarded: private mode / blocked storage) ---------- */
 const store = {
   get(k, d) { try { const v = localStorage.getItem("tb." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
@@ -29,6 +82,7 @@ const S = {
   seeking: false,
   startedAt: 0,
   loadToken: 0,
+  mode: "yt",       // iframe-only: YouTube plays the video directly in the browser; the server only does search + "what's next"
 };
 // Taste profile: sent to the server so autoplay adapts to this listener.
 const P = {
@@ -183,17 +237,18 @@ function recordFinished(t) { if (t) { recordLiked(t, 0.5); saveProfile(); } }
 async function playIndex(i, { manualSkip = false } = {}) {
   if (i < 0 || i >= S.queue.length) return;
   const prev = cur();
-  if (manualSkip && prev && audio.currentTime < 30 && (audio.duration || 0) > 60) recordSkip(prev);
+  if (manualSkip && prev && curTime() < 30 && curDur() > 60) recordSkip(prev);
   const token = ++S.loadToken;
   S.index = i;
   const t = cur();
   P.history = P.history.filter((id) => id !== t.videoId); P.history.push(t.videoId);
   P.recentTracks = [t, ...P.recentTracks.filter((x) => x.videoId !== t.videoId)];
   saveProfile();
-  audio.src = streamUrl(t.videoId);
-  audio.load();
   S.startedAt = Date.now();
   updateNowPlaying();
+  if (inYT()) { playViaYT(t); ensureQueue(); return; }
+  audio.src = streamUrl(t.videoId);
+  audio.load();
   try { await audio.play(); }
   catch (e) {
     if (token !== S.loadToken) return;
@@ -206,24 +261,21 @@ async function playIndex(i, { manualSkip = false } = {}) {
 
 function next({ manual = false } = {}) {
   if (S.index + 1 < S.queue.length) return playIndex(S.index + 1, { manualSkip: manual });
-  if (!S.autoplay) { audio.pause(); toast("End of queue. Turn on ∞ autoplay to keep going."); return; }
+  if (!S.autoplay) { pauseAll(); toast("End of queue. Turn on ∞ autoplay to keep going."); return; }
   return fetchMore().then(() => {
     if (S.index + 1 < S.queue.length) playIndex(S.index + 1, { manualSkip: manual });
     else toast("Couldn't find more songs right now");
   });
 }
 function prev() {
-  if (audio.currentTime > 4 || S.index <= 0) { audio.currentTime = 0; return; }
+  if (curTime() > 4 || S.index <= 0) { seekTo(0); return; }
   playIndex(S.index - 1);
 }
 
 function ensureQueue() {
   if (S.autoplay && S.queue.length - S.index - 1 <= 4) fetchMore();
 }
-function prewarmNext() {
-  const n = S.queue[S.index + 1];
-  if (n) api(`/api/prewarm/${n.videoId}`).catch(() => {});
-}
+function prewarmNext() { /* iframe-only: nothing to prepare on the server */ }
 
 async function fetchMore() {
   if (S.loadingMore || !S.queue.length) return;
@@ -253,13 +305,14 @@ async function fetchMore() {
 }
 
 /* ---------- audio events ---------- */
-audio.addEventListener("ended", () => {
+function handleEnded() {
   const t = cur();
   if (t && !t._counted) { t._counted = true; recordFinished(t); }
   S.failStreak = 0;
-  if (S.repeat) { audio.currentTime = 0; audio.play(); return; }
+  if (S.repeat) { seekTo(0); resumeAll(); return; }
   next();
-});
+}
+audio.addEventListener("ended", () => { if (!inYT()) handleEnded(); });
 audio.addEventListener("play", () => { setPlayIcon(true); setState("playing"); });
 audio.addEventListener("pause", () => { setPlayIcon(false); if (!audio.ended) setState("paused"); });
 audio.addEventListener("playing", () => { S.failStreak = 0; });
@@ -267,19 +320,25 @@ audio.addEventListener("loadedmetadata", () => { $("#t-dur").textContent = fmt(a
 audio.addEventListener("durationchange", updatePosition);
 audio.addEventListener("seeked", updatePosition);
 let lastPos = 0;
-audio.addEventListener("timeupdate", () => {
-  const d = audio.duration, c = audio.currentTime;
+function progress(c, d) {
   if (d && isFinite(d)) {
     const pct = (c / d) * 100;
     $("#mini-bar").style.width = pct + "%";
+    $("#t-dur").textContent = fmt(d);
     if (!S.seeking) { $("#seek").value = (c / d) * 1000; $("#seek").style.setProperty("--p", pct + "%"); $("#t-cur").textContent = fmt(c); }
     // Count a track as "listened to" once most of it has played (positive signal even if user skips after)
     const t = cur();
     if (t && !t._counted && c / d > 0.7) { t._counted = true; recordFinished(t); }
   }
   if (Date.now() - lastPos > 4000) { lastPos = Date.now(); updatePosition(); }
-});
+}
+audio.addEventListener("timeupdate", () => { if (!inYT()) progress(audio.currentTime, audio.duration); });
 let lastErrAt = 0;
+function onStreamFailed() {
+  const t = cur();
+  if (!t || inYT()) return onAudioError();
+  playViaYT(t);   // server couldn't fetch audio (often a blocked host IP): use YouTube's own player
+}
 function onAudioError() {
   if (Date.now() - lastErrAt < 1500) return;  // one skip per failure
   lastErrAt = Date.now();
@@ -291,7 +350,7 @@ function onAudioError() {
     setTimeout(() => next(), 400);
   } else { setPlayIcon(false); toast("Playback keeps failing — check the server / YouTube access."); }
 }
-audio.addEventListener("error", () => { if (audio.src && audio.error) onAudioError(); });
+audio.addEventListener("error", () => { if (audio.src && audio.error && !inYT()) onStreamFailed(); });
 audio.addEventListener("stalled", () => { /* network hiccup: browser retries by itself */ });
 
 /* ---------- UI wiring ---------- */
@@ -300,7 +359,7 @@ function setPlayIcon(playing) {
   $("#mini-play").textContent = icon; $("#play").textContent = icon;
   document.body.classList.toggle("paused", !playing);
 }
-function togglePlay() { if (!audio.src) return; audio.paused ? audio.play().catch(() => {}) : audio.pause(); }
+function togglePlay() { if (!cur()) return; isPaused() ? resumeAll() : pauseAll(); }
 $("#mini-play").addEventListener("click", togglePlay);
 $("#play").addEventListener("click", togglePlay);
 $("#mini-next").addEventListener("click", () => next({ manual: true }));
@@ -315,12 +374,12 @@ $("#shuffle-all").addEventListener("click", () => playList(S.results, true));
 $("#play-liked").addEventListener("click", () => playList(P.likes));
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !$("#sheet").hidden) closeSheet();
-  if (e.code === "Space" && !/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName) && audio.src) { e.preventDefault(); togglePlay(); }
+  if (e.code === "Space" && !/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName) && cur()) { e.preventDefault(); togglePlay(); }
 });
 
 const seek = $("#seek");
-seek.addEventListener("input", () => { S.seeking = true; const d = audio.duration || 0; $("#t-cur").textContent = fmt((seek.value / 1000) * d); seek.style.setProperty("--p", seek.value / 10 + "%"); });
-seek.addEventListener("change", () => { if (audio.duration) audio.currentTime = (seek.value / 1000) * audio.duration; S.seeking = false; });
+seek.addEventListener("input", () => { S.seeking = true; const d = curDur(); $("#t-cur").textContent = fmt((seek.value / 1000) * d); seek.style.setProperty("--p", seek.value / 10 + "%"); });
+seek.addEventListener("change", () => { if (curDur()) seekTo((seek.value / 1000) * curDur()); S.seeking = false; });
 
 function toggle(btn, key, on) { btn.setAttribute("aria-pressed", String(on)); }
 $("#autoplay").addEventListener("click", () => {
@@ -385,6 +444,7 @@ function setMediaSession(t) {
 }
 function updatePosition() {
   if (!("mediaSession" in navigator) || !navigator.mediaSession.setPositionState) return;
+  if (inYT()) return;
   const d = audio.duration;
   if (!d || !isFinite(d)) return;
   try { navigator.mediaSession.setPositionState({ duration: d, playbackRate: audio.playbackRate || 1, position: Math.min(audio.currentTime, d) }); } catch { /* ignore */ }
@@ -406,6 +466,7 @@ function updatePosition() {
 if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1")) {
   navigator.serviceWorker.register("sw.js").catch(() => {});
 }
+document.body.classList.add("yt-mode");
 toggle($("#autoplay"), "autoplay", S.autoplay);
 loadChips();
 renderHome();
