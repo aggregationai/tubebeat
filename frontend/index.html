@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="description" content="TubeBeat — a music player with endless autoplay radio and background playback.">
+  <meta name="theme-color" content="#0b0b0f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="TubeBeat">
+  <title>TubeBeat — music with endless radio</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png" type="image/png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Poppins:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#" id="brand" aria-label="TubeBeat home"><span class="brand-mark">♫</span><span class="brand-text">TubeBeat</span></a>
+      <form class="search" id="search-form" role="search" autocomplete="off">
+        <label class="sr-only" for="q">Search songs</label>
+        <input id="q" type="search" placeholder="Search songs, artists, albums" enterkeyhint="search" autocomplete="off" spellcheck="false">
+        <button type="submit" aria-label="Search">⌕</button>
+        <ul class="suggest" id="suggest" hidden></ul>
+      </form>
+      <label class="lang" title="Autoplay language preference">
+        <span class="sr-only">Autoplay language</span>
+        <select id="lang">
+          <option value="te">Telugu</option>
+          <option value="hi">Hindi</option>
+          <option value="ta">Tamil</option>
+          <option value="kn">Kannada</option>
+          <option value="ml">Malayalam</option>
+          <option value="any">Any language</option>
+        </select>
+      </label>
+    </div>
+  </header>
+
+  <main class="page" id="page">
+    <section id="home">
+      <h1 class="hero-title">Press play. <span>It keeps going.</span></h1>
+      <p class="hero-sub">Pick one song — the radio queues what fits next, in your language, and keeps playing with the screen off.</p>
+      <div class="chips" id="chips" aria-label="Quick picks"></div>
+      <div id="recent-block" hidden>
+        <div class="section-head"><h2>Recently played</h2></div>
+        <ul class="tracklist" id="recent-list"></ul>
+      </div>
+      <div id="liked-block" hidden>
+        <div class="section-head"><h2>Liked songs</h2><button class="pill" id="play-liked">▶ Play liked</button></div>
+        <ul class="tracklist" id="liked-list"></ul>
+      </div>
+    </section>
+
+    <section id="results" hidden aria-live="polite">
+      <div class="section-head">
+        <h2 id="results-title">Results</h2>
+        <div class="actions"><button class="pill primary" id="play-all">▶ Play all</button><button class="pill" id="shuffle-all">⤮ Shuffle</button></div>
+      </div>
+      <ul class="tracklist" id="results-list"></ul>
+    </section>
+  </main>
+
+  <!-- Mini player -->
+  <div class="mini" id="mini" hidden>
+    <div class="mini-progress"><span id="mini-bar"></span></div>
+    <button class="mini-main" id="mini-open" aria-label="Open player">
+      <img id="mini-art" alt="" width="48" height="48">
+      <span class="mini-text"><b id="mini-title">—</b><small id="mini-artist"></small></span>
+    </button>
+    <button class="icon" id="mini-prev" aria-label="Previous">⏮</button>
+    <button class="icon big" id="mini-play" aria-label="Play or pause">▶</button>
+    <button class="icon" id="mini-next" aria-label="Next">⏭</button>
+  </div>
+
+  <!-- Full player -->
+  <div class="sheet" id="sheet" hidden role="dialog" aria-modal="true" aria-label="Now playing">
+    <div class="sheet-bg" id="sheet-bg"></div>
+    <div class="sheet-inner">
+      <div class="sheet-top">
+        <button class="icon" id="sheet-close" aria-label="Close player">⌄</button>
+        <span class="sheet-label" id="radio-label">Now playing</span>
+        <button class="icon" id="sheet-share" aria-label="Open on YouTube">↗</button>
+      </div>
+      <div class="sheet-scroll">
+        <img class="cover" id="cover" alt="">
+        <div class="now">
+          <div class="now-text"><h2 id="now-title">—</h2><p id="now-artist"></p></div>
+          <button class="icon heart" id="like" aria-label="Like song" aria-pressed="false">♡</button>
+        </div>
+        <div class="seek">
+          <input type="range" id="seek" min="0" max="1000" value="0" step="1" aria-label="Seek">
+          <div class="times"><span id="t-cur">0:00</span><span id="t-dur">0:00</span></div>
+        </div>
+        <div class="controls">
+          <button class="icon" id="autoplay" aria-pressed="true" aria-label="Autoplay radio" title="Autoplay radio">∞</button>
+          <button class="icon lg" id="prev" aria-label="Previous">⏮</button>
+          <button class="icon xl play" id="play" aria-label="Play or pause">▶</button>
+          <button class="icon lg" id="next" aria-label="Next">⏭</button>
+          <button class="icon" id="repeat" aria-pressed="false" aria-label="Repeat song" title="Repeat song">⟲</button>
+        </div>
+        <div class="section-head up"><h3>Up next</h3><span class="hint" id="radio-hint">Radio keeps adding songs</span></div>
+        <ul class="tracklist queue" id="queue-list"></ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <audio id="audio" preload="auto" playsinline></audio>
+  <script src="app.js"></script>
+</body>
+</html>
